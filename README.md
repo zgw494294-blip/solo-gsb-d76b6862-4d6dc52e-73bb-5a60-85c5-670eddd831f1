@@ -280,6 +280,90 @@ curl -X POST http://localhost:8000/v1/completion-plans \
 
 初态本身已满足条件时（例如 `required_transition_ids` 为空且两端已在终态、队列均空），`completable` 为 `true` 且 `path` 为 `[]`，`visited_combinations` 为 `1`。
 
+## 最小停用方案：`POST /v1/deactivation-plans`
+
+在原有协议请求的基础上增加可选字段 `removable_transition_ids`（0～8 个**互异**的现有转移 ID，缺省为 `[]`）。服务尝试停用其中若干转移，使修订后的协议满足：**从初态可达的每个配置都存在一条通往完成配置的路径**（即使不存在死锁，只要存在无法到达完成的可达配置，该方案也不合格）。只允许停用列表内的转移。
+
+对每个候选方案，服务按原有一格队列语义重建可达图（完成配置不再扩展），并检查全部可达配置是否都能到达完成。方案选择规则：
+
+1. 停用转移数最少者优先；
+2. 数量相同时，按升序 ID 列表的字典序取第一个。
+
+响应字段：
+
+- `solvable`：是否存在合格的停用方案；
+- `deactivated_transition_ids`：停用的转移 ID 升序列表；原协议本身已合格时为 `[]`，无方案时为 `null`；
+- `reachable_configurations`：修订后从初态可达的配置数（含完成配置），无方案时为 `null`。
+
+### 可执行调用示例
+
+```bash
+curl -X POST http://localhost:8000/v1/deactivation-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "A": {
+      "states": [0, 1],
+      "initial": 0,
+      "finals": [1]
+    },
+    "B": {
+      "states": [0, 1],
+      "initial": 0,
+      "finals": [1]
+    },
+    "transitions": [
+      {
+        "id": "t1",
+        "from": "A",
+        "to": "B",
+        "action": "send",
+        "message": "m",
+        "source": 0,
+        "target": 1
+      },
+      {
+        "id": "t2",
+        "from": "A",
+        "to": "B",
+        "action": "receive",
+        "message": "m",
+        "source": 0,
+        "target": 1
+      },
+      {
+        "id": "t3",
+        "from": "A",
+        "to": "B",
+        "action": "send",
+        "message": "z",
+        "source": 0,
+        "target": 0
+      }
+    ],
+    "removable_transition_ids": ["t3"]
+  }'
+```
+
+示例中 `t3` 发出的 `z` 消息无人接收，会让协议进入死锁配置；停用 `t3` 后所有可达配置都能完成：
+
+```json
+{
+  "solvable": true,
+  "deactivated_transition_ids": ["t3"],
+  "reachable_configurations": 3
+}
+```
+
+同一请求去掉 `removable_transition_ids`（缺省为 `[]`，即不允许停用任何转移）时无合格方案：
+
+```json
+{
+  "solvable": false,
+  "deactivated_transition_ids": null,
+  "reachable_configurations": null
+}
+```
+
 ## 请求校验与 422
 
 以下情况返回 HTTP `422 Unprocessable Entity`：
@@ -299,6 +383,12 @@ curl -X POST http://localhost:8000/v1/completion-plans \
 - `required_transition_ids` 中出现请求未定义的转移 ID；
 - `required_transition_ids` 中包含重复 ID；
 - `required_transition_ids` 数量超过 6（或包含空 ID）。
+
+`POST /v1/deactivation-plans` 在通用规则之外，以下情况同样返回 `422 Unprocessable Entity`：
+
+- `removable_transition_ids` 中出现请求未定义的转移 ID；
+- `removable_transition_ids` 中包含重复 ID；
+- `removable_transition_ids` 数量超过 8（或包含空 ID）。
 
 ## 本地开发（不使用 Docker）
 

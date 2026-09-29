@@ -1,5 +1,6 @@
 from collections import deque
 from dataclasses import dataclass
+from itertools import combinations
 
 
 @dataclass(frozen=True)
@@ -43,10 +44,7 @@ def build_model(request) -> ProtocolModel:
         for item in sorted(request.transitions, key=lambda transition: transition.id)
     )
 
-    outgoing: dict[str, dict[object, list[Transition]]] = {"A": {}, "B": {}}
-    for transition in transitions:
-        owner = transition.sender if transition.action == "send" else transition.receiver
-        outgoing[owner].setdefault(transition.source, []).append(transition)
+    outgoing = _build_outgoing(transitions)
 
     initial = Configuration(
         request.A.initial,
@@ -61,13 +59,21 @@ def build_model(request) -> ProtocolModel:
 
     return ProtocolModel(
         transitions=transitions,
-        outgoing={
-            endpoint: {source: tuple(items) for source, items in by_source.items()}
-            for endpoint, by_source in outgoing.items()
-        },
+        outgoing=outgoing,
         initial=initial,
         finals=finals,
     )
+
+
+def _build_outgoing(transitions) -> dict[str, dict[object, tuple[Transition, ...]]]:
+    outgoing: dict[str, dict[object, list[Transition]]] = {"A": {}, "B": {}}
+    for transition in transitions:
+        owner = transition.sender if transition.action == "send" else transition.receiver
+        outgoing[owner].setdefault(transition.source, []).append(transition)
+    return {
+        endpoint: {source: tuple(items) for source, items in by_source.items()}
+        for endpoint, by_source in outgoing.items()
+    }
 
 
 def is_completion(configuration: Configuration, finals: dict[str, frozenset]) -> bool:
@@ -264,6 +270,86 @@ def plan_completion(request) -> dict:
         response["path"] = steps  # [] when the initial configuration already satisfies
 
     return response
+
+
+def plan_deactivation(request) -> dict:
+    model = build_model(request)
+    removable = sorted(request.removable_transition_ids)
+
+    # Candidates are tried by ascending deactivation count. For equal counts,
+    # combinations over the sorted ids are generated in lexicographic order of
+    # the ascending id lists, so the first qualifying candidate is the answer.
+    for size in range(len(removable) + 1):
+        for combo in combinations(removable, size):
+            deactivated = frozenset(combo)
+            kept = tuple(
+                transition for transition in model.transitions if transition.id not in deactivated
+            )
+            outgoing = _build_outgoing(kept)
+            adjacency = _reachable_graph(model, outgoing)
+            if _all_reach_completion(adjacency, model.finals):
+                return {
+                    "solvable": True,
+                    "deactivated_transition_ids": list(combo),
+                    "reachable_configurations": len(adjacency),
+                }
+
+    return {
+        "solvable": False,
+        "deactivated_transition_ids": None,
+        "reachable_configurations": None,
+    }
+
+
+def _reachable_graph(model, outgoing) -> dict[Configuration, list[Configuration]]:
+    """Reachable configurations from the initial one, mapped to their successors.
+
+    Shares the one-slot queue semantics of the protocol; completion
+    configurations are never expanded, so they keep empty successor lists.
+    """
+    adjacency: dict[Configuration, list[Configuration]] = {model.initial: []}
+    queue = deque([model.initial])
+
+    while queue:
+        current = queue.popleft()
+
+        if is_completion(current, model.finals):
+            # Completion configurations are never expanded.
+            continue
+
+        successors = []
+        for transition in enabled_transitions(current, outgoing):
+            nxt = apply_transition(current, transition)
+            successors.append(nxt)
+            if nxt not in adjacency:
+                adjacency[nxt] = []
+                queue.append(nxt)
+        adjacency[current] = successors
+
+    return adjacency
+
+
+def _all_reach_completion(adjacency, finals) -> bool:
+    """True when every reachable configuration can reach a completion configuration."""
+    completions = [config for config in adjacency if is_completion(config, finals)]
+    if not completions:
+        return False
+
+    reverse: dict[Configuration, list[Configuration]] = {config: [] for config in adjacency}
+    for current, successors in adjacency.items():
+        for nxt in successors:
+            reverse[nxt].append(current)
+
+    good = set(completions)
+    stack = list(completions)
+    while stack:
+        current = stack.pop()
+        for previous in reverse[current]:
+            if previous not in good:
+                good.add(previous)
+                stack.append(previous)
+
+    return len(good) == len(adjacency)
 
 
 def _rebuild_chain(parents, target, configuration_of) -> list[tuple[Configuration, Transition]]:
