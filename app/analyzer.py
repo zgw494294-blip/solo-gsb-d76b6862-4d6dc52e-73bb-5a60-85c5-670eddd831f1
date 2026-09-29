@@ -1,5 +1,6 @@
 from collections import deque
 from dataclasses import dataclass
+from itertools import combinations
 
 
 @dataclass(frozen=True)
@@ -264,6 +265,120 @@ def plan_completion(request) -> dict:
         response["path"] = steps  # [] when the initial configuration already satisfies
 
     return response
+
+
+def plan_deactivation(request) -> dict:
+    model = build_model(request)
+    removable = sorted(request.removable_transition_ids)
+
+    # Candidates are the subsets of the removable ids. combinations() over the
+    # sorted ids enumerates each size in lexicographic order of the ascending id
+    # list, so the first qualifying candidate is the required one: fewest
+    # deactivations, ties broken by the sorted id list.
+    for size in range(len(removable) + 1):
+        for combo in combinations(removable, size):
+            revised = _restrict_model(model, frozenset(combo))
+            reachable, successors = _reachable_graph(revised)
+            if _all_reach_completion(revised, reachable, successors):
+                return {
+                    "feasible": True,
+                    "deactivated_transition_ids": list(combo),
+                    "reachable_configurations": len(reachable),
+                }
+
+    return {
+        "feasible": False,
+        "deactivated_transition_ids": None,
+        "reachable_configurations": None,
+    }
+
+
+def _restrict_model(model: ProtocolModel, deactivated: frozenset) -> ProtocolModel:
+    """The model with the given transitions removed; everything else is kept."""
+    transitions = tuple(
+        transition for transition in model.transitions if transition.id not in deactivated
+    )
+
+    outgoing: dict[str, dict[object, list[Transition]]] = {"A": {}, "B": {}}
+    for transition in transitions:
+        owner = transition.sender if transition.action == "send" else transition.receiver
+        outgoing[owner].setdefault(transition.source, []).append(transition)
+
+    return ProtocolModel(
+        transitions=transitions,
+        outgoing={
+            endpoint: {source: tuple(items) for source, items in by_source.items()}
+            for endpoint, by_source in outgoing.items()
+        },
+        initial=model.initial,
+        finals=model.finals,
+    )
+
+
+def _reachable_graph(
+    model: ProtocolModel,
+) -> tuple[set[Configuration], dict[Configuration, tuple[Configuration, ...]]]:
+    """All configurations reachable from the initial one, plus the successor edges.
+
+    Shares the one-slot queue semantics of the other analyses; completion
+    configurations are never expanded.
+    """
+    seen = {model.initial}
+    successors: dict[Configuration, tuple[Configuration, ...]] = {}
+    queue = deque([model.initial])
+
+    while queue:
+        current = queue.popleft()
+
+        if is_completion(current, model.finals):
+            successors[current] = ()
+            continue
+
+        nexts = []
+        for transition in enabled_transitions(current, model.outgoing):
+            nxt = apply_transition(current, transition)
+            nexts.append(nxt)
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append(nxt)
+        successors[current] = tuple(nexts)
+
+    return seen, successors
+
+
+def _all_reach_completion(
+    model: ProtocolModel,
+    reachable: set[Configuration],
+    successors: dict[Configuration, tuple[Configuration, ...]],
+) -> bool:
+    """True when every reachable configuration can reach a completion configuration.
+
+    Deadlock-free is not enough: configurations trapped in cycles that never
+    complete also disqualify the candidate.
+    """
+    completions = [
+        configuration for configuration in reachable if is_completion(configuration, model.finals)
+    ]
+
+    predecessors: dict[Configuration, list[Configuration]] = {
+        configuration: [] for configuration in reachable
+    }
+    for source, nexts in successors.items():
+        for nxt in nexts:
+            predecessors[nxt].append(source)
+
+    # Reverse traversal from the completion configurations marks everything
+    # that can reach one of them.
+    can_complete = set(completions)
+    stack = list(completions)
+    while stack:
+        current = stack.pop()
+        for predecessor in predecessors[current]:
+            if predecessor not in can_complete:
+                can_complete.add(predecessor)
+                stack.append(predecessor)
+
+    return reachable <= can_complete
 
 
 def _rebuild_chain(parents, target, configuration_of) -> list[tuple[Configuration, Transition]]:

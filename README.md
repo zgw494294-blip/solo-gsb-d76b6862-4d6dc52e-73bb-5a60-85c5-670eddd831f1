@@ -2,6 +2,8 @@
 
 基于 Python + FastAPI，对 A、B 两端的 send/receive 状态机做离线可达性分析。服务完全离线运行，不依赖数据库或外部服务。
 
+提供三个接口：死锁检测（`POST /v1/deadlocks`）、带里程碑的完成计划（`POST /v1/completion-plans`）、最小停用方案（`POST /v1/deactivation-plans`）。
+
 ## 协议模型
 
 - A、B 各有 1～8 个状态，一个初态和一个非空终态集。
@@ -280,6 +282,93 @@ curl -X POST http://localhost:8000/v1/completion-plans \
 
 初态本身已满足条件时（例如 `required_transition_ids` 为空且两端已在终态、队列均空），`completable` 为 `true` 且 `path` 为 `[]`，`visited_combinations` 为 `1`。
 
+## 最小停用方案：`POST /v1/deactivation-plans`
+
+在原有协议请求的基础上增加可选字段 `removable_transition_ids`（0～8 个**互异**的现有转移 ID，缺省为 `[]`）。服务枚举这些「允许停用」转移的全部子集；对每个候选子集，按原有的一格队列语义重建从初态出发的可达图（完成配置不再扩展），并判定：
+
+- 从初态可达的**每个**配置都至少存在一条通往完成配置的路径。
+
+即使修订后没有任何死锁，只要存在一个无法到达完成的可达配置（例如陷入永不完成的循环），该候选也不合格。只能停用 `removable_transition_ids` 中列出的转移，其余转移始终保留。
+
+方案选择：优先停用数量最少；数量相同时，按升序排列的停用 ID 列表的字典序取第一个。
+
+响应字段：
+
+- `feasible`：是否存在合格方案；
+- `deactivated_transition_ids`：实际停用的转移 ID（升序）；无方案时为 `null`，原协议本身已合格时为 `[]`；
+- `reachable_configurations`：修订后协议从初态可达的配置数；无方案时为 `null`。
+
+### 可执行调用示例
+
+```bash
+curl -X POST http://localhost:8000/v1/deactivation-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "A": {
+      "states": [0, 1],
+      "initial": 0,
+      "finals": [1]
+    },
+    "B": {
+      "states": [0, 1],
+      "initial": 0,
+      "finals": [1]
+    },
+    "transitions": [
+      {
+        "id": "t1",
+        "from": "A",
+        "to": "B",
+        "action": "send",
+        "message": "m",
+        "source": 0,
+        "target": 1
+      },
+      {
+        "id": "t2",
+        "from": "A",
+        "to": "B",
+        "action": "receive",
+        "message": "m",
+        "source": 0,
+        "target": 1
+      },
+      {
+        "id": "t3",
+        "from": "B",
+        "to": "A",
+        "action": "send",
+        "message": "x",
+        "source": 0,
+        "target": 1
+      }
+    ],
+    "removable_transition_ids": ["t3"]
+  }'
+```
+
+`t3` 发出的 `x` 没有任何接收转移，一旦执行就会卡死；停用 `t3` 后所有可达配置都能完成：
+
+```json
+{
+  "feasible": true,
+  "deactivated_transition_ids": ["t3"],
+  "reachable_configurations": 3
+}
+```
+
+同一请求去掉 `removable_transition_ids`（缺省为 `[]`，即不允许停用任何转移）时无合格方案：
+
+```json
+{
+  "feasible": false,
+  "deactivated_transition_ids": null,
+  "reachable_configurations": null
+}
+```
+
+原协议本身已合格时（例如上例只保留 `t1`、`t2`），`deactivated_transition_ids` 为 `[]`，`reachable_configurations` 为原协议的可达配置数。
+
 ## 请求校验与 422
 
 以下情况返回 HTTP `422 Unprocessable Entity`：
@@ -299,6 +388,12 @@ curl -X POST http://localhost:8000/v1/completion-plans \
 - `required_transition_ids` 中出现请求未定义的转移 ID；
 - `required_transition_ids` 中包含重复 ID；
 - `required_transition_ids` 数量超过 6（或包含空 ID）。
+
+`POST /v1/deactivation-plans` 在上述规则之外，以下情况同样返回 `422 Unprocessable Entity`：
+
+- `removable_transition_ids` 中出现请求未定义的转移 ID；
+- `removable_transition_ids` 中包含重复 ID；
+- `removable_transition_ids` 数量超过 8（或包含空 ID）。
 
 ## 本地开发（不使用 Docker）
 

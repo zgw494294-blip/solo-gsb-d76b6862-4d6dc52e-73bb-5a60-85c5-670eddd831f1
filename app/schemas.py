@@ -104,6 +104,26 @@ class CompletionRequest(DeadlockRequest):
         return self
 
 
+class DeactivationRequest(DeadlockRequest):
+    removable_transition_ids: Annotated[list[NonEmptyId], Field(min_length=0, max_length=8)] = (
+        Field(default_factory=list)
+    )
+
+    @model_validator(mode="after")
+    def validate_removable_transition_ids(self) -> Self:
+        if len(set(self.removable_transition_ids)) != len(self.removable_transition_ids):
+            raise ValueError("removable_transition_ids must not contain duplicates")
+        known = {transition.id for transition in self.transitions}
+        unknown = [
+            transition_id
+            for transition_id in self.removable_transition_ids
+            if transition_id not in known
+        ]
+        if unknown:
+            raise ValueError(f"unknown removable_transition_ids: {unknown}")
+        return self
+
+
 class StateView(BaseModel):
     A: StateId
     B: StateId
@@ -145,3 +165,9 @@ class CompletionResponse(BaseModel):
     visited_combinations: int
     initial: ConfigurationView
     path: list[PathStep] | None = None
+
+
+class DeactivationResponse(BaseModel):
+    feasible: bool
+    deactivated_transition_ids: list[str] | None = None
+    reachable_configurations: int | None = None
